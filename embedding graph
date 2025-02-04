@@ -1,0 +1,39 @@
+import numpy as np
+import os
+from scipy.spatial.distance import cdist
+import logging
+
+# Logger setup
+logger = logging.getLogger('__main__')
+logging.basicConfig(level=logging.INFO)
+
+def compute_distance_matrix(embeddings_file, output_path):
+    """
+    Computes and saves a pairwise distance matrix for embeddings.
+
+    Parameters:
+    embeddings_file (str): Path to the embeddings file (saved as .npy).
+    output_path (str): Path to save the computed distance matrix.
+    """
+    # Load embeddings
+    logger.info("Loading embeddings...")
+    embeddings = np.load(embeddings_file)
+    logger.info(f"Embeddings loaded. Shape: {embeddings.shape}")
+
+    # Compute pairwise distance matrix
+    logger.info("Computing pairwise distance matrix...")
+    distance_matrix = cdist(embeddings, embeddings, metric='euclidean')  # Euclidean distance
+    logger.info(f"Distance matrix computed. Shape: {distance_matrix.shape}")
+
+    # Save the distance matrix
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)  # Ensure directory exists
+    np.save(output_path, distance_matrix)
+    logger.info(f"Distance matrix saved to {output_path}")
+
+if __name__ == "__main__":
+    # Paths
+    embeddings_file = "/content/drive/MyDrive/Final_S/Embeddings/StarLightCurves/X_embeddings.npy"
+    output_path = "/content/drive/MyDrive/Final_S/Embeddings/StarLightCurves/StarLightCurves_emb_matrix.npy"
+
+    # Compute and save distance matrix
+    compute_distance_matrix(embeddings_file, output_path)
