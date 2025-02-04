@@ -22,6 +22,14 @@ By leveraging a combination of **Series2Vec, ResNet, and Graph Convolutional Net
 
 ---
 
+## **Datasets**
+The model has been tested on two large datasets from the UCR Time Series Archive:
+
+📌 FordB (Sensor-based): 500-length sequences, 4,446 samples
+📌 StarLightCurves (SLC) (Astronomical): 1024-length sequences, 9,236 samples
+
+---
+
 ## **Installation**  
 To set up the project environment, follow these steps:
 
@@ -29,3 +37,4 @@ To set up the project environment, follow these steps:
 ```bash
 git clone https://github.com/your-username/your-repository.git
 cd your-repository
+
