@@ -1,0 +1,374 @@
+# Import necessary libraries
+import os
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+import math
+import uuid
+
+
+np.random.seed(1)
+torch.manual_seed(1)
+
+# Define paths
+data_path = "/content/drive/MyDrive/Final_S/Dataset/StarLightCurves/dataset_combined_4.npz"
+distances_path = "/content/drive/MyDrive/Final_S/Embeddings/StarLightCurves/StarLightCurves_emb_matrix.npy"
+model_save_path = "/content/drive/MyDrive/Final_S/RESULTS/StarLightCurves/Simtsc_S2V_N"
+
+# Hyperparameters
+K = 3
+alpha = 0.3
+batch_size = 128
+epochs = 500
+
+# Setup the device
+if torch.cuda.is_available():
+    device = torch.device("cuda:0")
+    print("--> Running on the GPU")
+else:
+    device = torch.device("cpu")
+    print("--> Running on the CPU")
+
+# Helper functions and classes
+def read_dataset_from_npy(path):
+    """Read dataset from .npz file"""
+    data = np.load(path, allow_pickle=True)
+    X = data['X']
+    y = data['y']
+    train_idx = data['train_idx']
+    test_idx = data['test_idx']
+    return X, y, train_idx, test_idx
+
+class Logger:
+    def __init__(self, f):
+        self.f = f
+
+    def log(self, content):
+        print(content)
+        self.f.write(content + '\n')
+        self.f.flush()
+
+class Dataset(torch.utils.data.Dataset):
+    def __init__(self, idx):
+        self.idx = idx
+
+    def __getitem__(self, index):
+        return self.idx[index]
+
+    def __len__(self):
+        return len(self.idx)
+
+# Model definitions
+class ResNetBlock(nn.Module):
+    def __init__(self, in_channels, out_channels):
+        super(ResNetBlock, self).__init__()
+        self.expand = True if in_channels < out_channels else False
+
+        self.conv_x = nn.Conv1d(in_channels, out_channels, 7, padding=3)
+        self.bn_x = nn.BatchNorm1d(out_channels)
+        self.conv_y = nn.Conv1d(out_channels, out_channels, 5, padding=2)
+        self.bn_y = nn.BatchNorm1d(out_channels)
+        self.conv_z = nn.Conv1d(out_channels, out_channels, 3, padding=1)
+        self.bn_z = nn.BatchNorm1d(out_channels)
+
+        if self.expand:
+            self.shortcut_y = nn.Conv1d(in_channels, out_channels, 1)
+        self.bn_shortcut_y = nn.BatchNorm1d(out_channels)
+
+    def forward(self, x):
+        out = F.relu(self.bn_x(self.conv_x(x)))
+        out = F.relu(self.bn_y(self.conv_y(out)))
+        out = self.bn_z(self.conv_z(out))
+
+        if self.expand:
+            x = self.shortcut_y(x)
+        x = self.bn_shortcut_y(x)
+        out += x
+        out = F.relu(out)
+
+        return out
+
+class GraphConvolution(nn.Module):
+    """Simple GCN layer"""
+
+    def __init__(self, in_features, out_features, bias=True):
+        super(GraphConvolution, self).__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.weight = nn.Parameter(
+            torch.FloatTensor(in_features, out_features)
+        )
+        if bias:
+            self.bias = nn.Parameter(torch.FloatTensor(out_features))
+        else:
+            self.register_parameter('bias', None)
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        stdv = 1.0 / math.sqrt(self.weight.size(0))
+        self.weight.data.uniform_(-stdv, stdv)
+        if self.bias is not None:
+            self.bias.data.uniform_(-stdv, stdv)
+
+    def forward(self, input, adj):
+        support = torch.mm(input, self.weight)
+        output = torch.spmm(adj, support)
+        if self.bias is not None:
+            return output + self.bias
+        else:
+            return output
+
+class SimTSC(nn.Module):
+    def __init__(self, input_size, nb_classes, num_layers=1, n_feature_maps=64, dropout=0.5):
+        super(SimTSC, self).__init__()
+        self.num_layers = num_layers
+
+        self.block_1 = ResNetBlock(input_size, n_feature_maps)
+        self.block_2 = ResNetBlock(n_feature_maps, n_feature_maps)
+        self.block_3 = ResNetBlock(n_feature_maps, n_feature_maps)
+
+        if self.num_layers == 1:
+            self.gc1 = GraphConvolution(n_feature_maps, nb_classes)
+        elif self.num_layers == 2:
+            self.gc1 = GraphConvolution(n_feature_maps, n_feature_maps)
+            self.gc2 = GraphConvolution(n_feature_maps, nb_classes)
+            self.dropout = dropout
+        elif self.num_layers == 3:
+            self.gc1 = GraphConvolution(n_feature_maps, n_feature_maps)
+            self.gc2 = GraphConvolution(n_feature_maps, n_feature_maps)
+            self.gc3 = GraphConvolution(n_feature_maps, nb_classes)
+            self.dropout = dropout
+
+    def forward(self, x, adj, K, alpha):
+        ranks = torch.argsort(adj, dim=1)
+        sparse_index = [[], []]
+        sparse_value = []
+        for i in range(len(adj)):
+            _sparse_value = []
+            for j in ranks[i][:K]:
+                sparse_index[0].append(i)
+                sparse_index[1].append(j)
+                _sparse_value.append(1 / np.exp(alpha * adj[i][j]))
+            _sparse_value = np.array(_sparse_value)
+            _sparse_value /= _sparse_value.sum()
+            sparse_value.extend(_sparse_value.tolist())
+        sparse_index = torch.LongTensor(sparse_index)
+        sparse_value = torch.FloatTensor(sparse_value)
+        #adj = torch.sparse.FloatTensor(sparse_index, sparse_value, adj.size())
+        adj = torch.sparse_coo_tensor(sparse_index, sparse_value, adj.size())
+
+        device = self.gc1.bias.device
+        adj = adj.to(device)
+
+        x = self.block_1(x)
+        x = self.block_2(x)
+        x = self.block_3(x)
+        x = F.avg_pool1d(x, x.shape[-1]).squeeze()
+
+        if self.num_layers == 1:
+            x = self.gc1(x, adj)
+        elif self.num_layers == 2:
+            x = F.relu(self.gc1(x, adj))
+            x = F.dropout(x, self.dropout, training=self.training)
+            x = self.gc2(x, adj)
+        elif self.num_layers == 3:
+            x = F.relu(self.gc1(x, adj))
+            x = F.dropout(x, self.dropout, training=self.training)
+            x = F.relu(self.gc2(x, adj))
+            x = F.dropout(x, self.dropout, training=self.training)
+            x = self.gc3(x, adj)
+
+        x = F.log_softmax(x, dim=1)
+
+        return x
+
+class SimTSCTrainer:
+    def __init__(self, device, logger, model_save_path):
+        self.device = device
+        self.logger = logger
+        self.model_save_path = model_save_path
+        self.tmp_dir = 'tmp'
+        if not os.path.exists(self.tmp_dir):
+            os.makedirs(self.tmp_dir)
+
+    def fit(self, model, X, y, train_idx, test_idx, distances, K, alpha, batch_size=128, epochs=500):
+        self.K = K
+        self.alpha = alpha
+
+        train_batch_size = min(batch_size // 2, len(train_idx))
+        other_idx = np.array([i for i in range(len(X)) if i not in train_idx])
+        other_batch_size = min(batch_size - train_batch_size, len(other_idx))
+        train_dataset = Dataset(train_idx)
+        train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=train_batch_size, shuffle=True, num_workers=1)
+
+        test_batch_size = min(batch_size // 2, len(test_idx))
+        other_idx_test = np.array([i for i in range(len(X)) if i not in test_idx])
+        other_batch_size_test = min(batch_size - test_batch_size, len(other_idx_test))
+        test_dataset = Dataset(test_idx)
+        test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=test_batch_size, shuffle=False, num_workers=1)
+
+        self.adj = torch.from_numpy(distances.astype(np.float32))
+
+        self.X, self.y = torch.from_numpy(X).float(), torch.from_numpy(y).long()
+        best_model_path = os.path.join(self.model_save_path, 'best_model.pth')
+
+        optimizer = optim.Adam(model.parameters(), lr=1e-3, weight_decay=4e-3)
+
+        best_acc = 0.0
+
+        # Lists to store training and testing metrics
+        train_losses = []
+        train_accuracies = []
+        test_losses = []
+        test_accuracies = []
+
+        # Training
+        for epoch in range(epochs):
+            model.train()
+            epoch_loss = 0.0
+            epoch_correct = 0
+            epoch_total = 0
+
+            for sampled_train_idx in train_loader:
+                optimizer.zero_grad()
+                sampled_other_idx = np.random.choice(other_idx, other_batch_size, replace=False)
+                idx = np.concatenate((sampled_train_idx, sampled_other_idx))
+                _X = self.X[idx].to(self.device)
+                _y = self.y[sampled_train_idx].to(self.device)
+                _adj = self.adj[idx][:, idx]
+
+                outputs = model(_X, _adj, K, alpha)
+                loss = F.nll_loss(outputs[:len(sampled_train_idx)], _y)
+                loss.backward()
+                optimizer.step()
+
+                epoch_loss += loss.item() * len(sampled_train_idx)
+
+                preds = outputs[:len(sampled_train_idx)].max(1)[1].type_as(_y)
+                correct = preds.eq(_y).double().sum().item()
+                epoch_correct += correct
+                epoch_total += len(sampled_train_idx)
+
+            # Compute average loss and accuracy for the epoch
+            epoch_loss /= epoch_total
+            epoch_accuracy = epoch_correct / epoch_total
+
+            train_losses.append(epoch_loss)
+            train_accuracies.append(epoch_accuracy)
+
+            # Evaluate on test set
+            model.eval()
+            test_loss, test_accuracy = self.evaluate(model, test_loader, other_idx_test, other_batch_size_test)
+            test_losses.append(test_loss)
+            test_accuracies.append(test_accuracy)
+
+            # Check if this is the best model based on test accuracy
+            if test_accuracy >= best_acc:
+                best_acc = test_accuracy
+                torch.save(model.state_dict(), best_model_path)
+                print(f'--> Best model saved at epoch {epoch} with test accuracy: {best_acc:.4f}')
+                self.logger.log(f'--> Best model saved at epoch {epoch} with test accuracy: {best_acc:.4f}')
+
+            # Print training and testing metrics
+            print(f'Epoch {epoch}: Train Loss {epoch_loss:.4f}, Train Acc {epoch_accuracy:.4f}, Test Loss {test_loss:.4f}, Test Acc {test_accuracy:.4f}')
+            #self.logger.log(f'Epoch {epoch}: Train Loss {epoch_loss:.4f}, Train Acc {epoch_accuracy:.4f}, Test Loss {test_loss:.4f}, Test Acc {test_accuracy:.4f}')
+
+            # Save metrics every 10 epochs
+            if (epoch + 1) % 10 == 0:
+                # Save metrics to files
+                np.save(os.path.join(self.model_save_path, 'train_losses.npy'), np.array(train_losses))
+                np.save(os.path.join(self.model_save_path, 'train_accuracies.npy'), np.array(train_accuracies))
+                np.save(os.path.join(self.model_save_path, 'test_losses.npy'), np.array(test_losses))
+                np.save(os.path.join(self.model_save_path, 'test_accuracies.npy'), np.array(test_accuracies))
+
+        # Load the best model
+        model.load_state_dict(torch.load(best_model_path))
+        model.eval()
+
+        return model
+
+    def evaluate(self, model, loader, other_idx, other_batch_size):
+        total_loss = 0.0
+        correct = 0
+        total = 0
+        with torch.no_grad():
+            for batch_idx in loader:
+                sampled_other_idx = np.random.choice(other_idx, other_batch_size, replace=False)
+                idx = np.concatenate((batch_idx, sampled_other_idx))
+                _X = self.X[idx].to(self.device)
+                _y = self.y[batch_idx].to(self.device)
+                _adj = self.adj[idx][:, idx]
+                outputs = model(_X, _adj, self.K, self.alpha)
+                loss = F.nll_loss(outputs[:len(batch_idx)], _y)
+                total_loss += loss.item() * len(batch_idx)
+
+                preds = outputs[:len(batch_idx)].max(1)[1].type_as(_y)
+                correct += preds.eq(_y).double().sum().item()
+                total += len(batch_idx)
+        avg_loss = total_loss / total
+        accuracy = correct / total
+        return avg_loss, accuracy
+
+    def test(self, model, test_idx, batch_size=128):
+        test_batch_size = min(batch_size // 2, len(test_idx))
+        other_idx_test = np.array([i for i in range(len(self.X)) if i not in test_idx])
+        other_batch_size_test = min(batch_size - test_batch_size, len(other_idx_test))
+        test_dataset = Dataset(test_idx)
+        test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=test_batch_size, shuffle=False, num_workers=1)
+        _, acc = self.evaluate(model, test_loader, other_idx_test, other_batch_size_test)
+        return acc
+
+def train(X, y, train_idx, test_idx, distances, device, logger, K, alpha):
+    nb_classes = len(np.unique(y))
+    input_size = X.shape[1]
+
+    model = SimTSC(input_size, nb_classes)
+    model = model.to(device)
+    trainer = SimTSCTrainer(device, logger, model_save_path)
+
+    model = trainer.fit(model, X, y, train_idx, test_idx, distances, K, alpha, batch_size=batch_size, epochs=epochs)
+    acc = trainer.test(model, test_idx)
+
+    return acc
+
+# Main training loop
+if __name__ == "__main__":
+    # Load data
+    X, y, train_idx, test_idx = read_dataset_from_npy(data_path)
+
+    # Print data shapes
+    print('X shape:', X.shape)
+    print('y shape:', y.shape)
+    print('train_idx shape:', train_idx.shape)
+    print('test_idx shape:', test_idx.shape)
+
+
+    # Ensure the model save path exists
+    if not os.path.exists(model_save_path):
+        os.makedirs(model_save_path)
+    logger = Logger(open(os.path.join(model_save_path, 'training_log.txt'), 'w'))
+
+    import numpy as np
+
+    # Path to the saved distance matrix
+    matrix_path = "/content/drive/MyDrive/Final_S/Embeddings/StarLightCurves/StarLightCurves_emb_matrix.npy"
+
+    # Load the distance matrix
+    try:
+        distance_matrix = np.load(matrix_path)
+        print(f"Distance matrix loaded successfully with shape: {distance_matrix.shape}")
+    except FileNotFoundError:
+        print(f"Error: Distance matrix file not found at {matrix_path}")
+    except Exception as e:
+        print(f"An error occurred while loading the distance matrix: {e}")
+
+    distance_matrix = np.load(matrix_path)
+    print(f"Distance matrix loaded successfully with shape: {distance_matrix.shape}")
+
+    # Train the model
+    acc = train(X, y, train_idx, test_idx, distance_matrix, device, logger, K, alpha)
+
+    logger.log('--> Final Test Accuracy: {:5.4f}'.format(acc))
+    logger.log(str(acc))
