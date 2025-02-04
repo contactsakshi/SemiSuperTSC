@@ -1,0 +1,91 @@
+import os
+import torch
+import numpy as np
+import logging
+from torch.utils.data import DataLoader, TensorDataset
+
+# Logger setup
+logger = logging.getLogger('__main__')
+logging.basicConfig(level=logging.INFO)
+
+# Load the pretrained Series2Vec model
+def load_series2vec_model(config, device, Data):
+    """
+    Loads a pretrained Series2Vec model.
+    """
+    logger.info("Loading Pretrained Series2Vec model ...")
+    model = Model_factory(config, Data)
+    save_path = config["model_path"]
+
+    # Create a dummy optimizer for compatibility
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
+    config['optimizer'] = optimizer
+
+    # Load the model
+    SS_Encoder, optimizer, start_epoch = load_model(model, save_path, config['optimizer'])
+    SS_Encoder.to(device)
+    SS_Encoder.eval()
+    logger.info(f"Loaded model from {save_path}. Epoch: {start_epoch}")
+    return SS_Encoder
+
+def main():
+    # Config
+    config = {
+        "data_file": "/content/drive/MyDrive/Final_S/Dataset/StarLightCurves/StarLightCurves.npy",
+        "processed_file": "/content/drive/MyDrive/Final_S/Dataset/StarLightCurves/dataset_combined_1.npz",
+        "output_path": "/content/drive/MyDrive/Final_S/Embeddings/StarLightCurves",
+        "model_path": '/content/drive/MyDrive/Final_S/RESULTS/StarLightCurves/Pre_Training/StarLightCurves/2024-12-02_23-51/checkpoints/StarLightCurves_model_last.pth',
+        "device": torch.device("cuda" if torch.cuda.is_available() else "cpu"),
+        "dataset": "FordB",
+        "Training_mode": "Pre_Tuning",
+        "Model_Type": ["Series2Vec"],
+        "layers": 4,
+        "emb_size": 16,
+        "dim_ff": 256,
+        "rep_size": 320,
+        "num_heads": 8,
+        "batch_size": 32,
+        "lr": 1e-3,
+        "dropout": 0.01,
+        "val_interval": 2,
+        "key_metric": "accuracy",
+        "gpu": "0",
+        "seed": 1234,
+        "problem": "FordB",
+    }
+
+    # Step 1: Load Dataset
+    logger.info("Loading dataset...")
+    ddata = np.load(config["data_file"], allow_pickle=True).item()  # Original data with labels
+    processed_data = np.load(config["processed_file"], allow_pickle=True)  # Processed dataset as NpzFile
+    X = torch.tensor(processed_data["X"], dtype=torch.float32)  # Access 'X' directly
+    logger.info(f"Dataset loaded. Shape: {X.shape}")
+
+    # Step 2: Load Pretrained Model
+    logger.info("Loading Series2Vec model...")
+    model = load_series2vec_model(config, config["device"], ddata)
+
+    # Step 3: Compute Embeddings in Batches
+    logger.info("Computing embeddings in batches...")
+    dataset = TensorDataset(X)  # Wrap the dataset in TensorDataset
+    dataloader = DataLoader(dataset, batch_size=config["batch_size"], shuffle=False)  # Use DataLoader
+    embeddings_list = []  # Store embeddings for all batches
+
+    with torch.no_grad():
+        for i, (batch,) in enumerate(dataloader):  # Process one batch at a time
+            batch = batch.to(config["device"])
+            batch_embeddings = model.linear_prob(batch)  # Compute embeddings for the batch
+            embeddings_list.append(batch_embeddings.cpu())  # Move to CPU and store
+            logger.info(f"Processed batch {i + 1}/{len(dataloader)}")
+
+    embeddings = torch.cat(embeddings_list)  # Concatenate all batch embeddings
+    logger.info(f"Embeddings computed. Shape: {embeddings.shape}")
+
+    # Step 4: Save Embeddings
+    os.makedirs(config["output_path"], exist_ok=True)
+    embeddings_file = os.path.join(config["output_path"], "X_embeddings.npy")
+    np.save(embeddings_file, embeddings.numpy())  # Save embeddings as a NumPy file
+    logger.info(f"Embeddings saved to {embeddings_file}")
+
+if __name__ == "__main__":
+    main()
